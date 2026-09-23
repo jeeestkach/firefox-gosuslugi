@@ -53,6 +53,95 @@ function run(argv) {
 JS
 }
 
+# Утилиты КриптоПро (переопределяются только для проверок установщика).
+CP_BIN="${CP_BIN:-/opt/cprocsp/bin}"
+CP_SBIN="${CP_SBIN:-/opt/cprocsp/sbin}"
+CP_KEYS_DIR="${CP_KEYS_DIR:-/var/opt/cprocsp/keys/$(id -un)}"
+
+# Разбирает вывод «certmgr -list» в строки: владелец|издатель|действует до|встроенная лицензия|ключ|контейнер.
+cert_records() {
+  awk '
+    function flush() { if (have) printf "%s|%s|%s|%s|%s|%s\n", subj, iss, na, lic, pk, cont; have = 0; subj = iss = na = lic = pk = cont = "" }
+    /^[0-9]+-------/ { flush(); have = 1; next }
+    /^====/ { flush(); next }
+    have && index($0, " : ") {
+      k = substr($0, 1, index($0, " : ") - 1); sub(/[ \t]+$/, "", k); v = substr($0, index($0, " : ") + 3)
+      if (k == "Subject") subj = v; else if (k == "Issuer") iss = v; else if (k == "Not valid after") na = v
+      else if (k == "Embedded License") lic = v; else if (k == "PrivateKey Link") pk = v; else if (k == "Container") cont = v
+    }
+    END { flush() }'
+}
+
+# Имя из DN (значение CN=…). $1 — строка Subject/Issuer.
+dn_cn() {
+  local cn; cn="$(printf '%s' "$1" | sed -n 's/.*CN=\([^,]*\).*/\1/p')"
+  [ -n "$cn" ] && printf '%s' "$cn" || printf '%s' "$1"
+}
+
+# «дд/мм/гггг …» → «дд.мм.гггг (осталось N дн.)». $1 — значение Not valid after.
+expiry_text() {
+  local d t now left; d="${1%% *}"
+  t="$(date -j -f "%d/%m/%Y" "$d" "+%s" 2>/dev/null || true)"
+  [ -n "$t" ] || { printf '%s' "$1"; return; }
+  now="$(date "+%s")"; left=$(( (t - now) / 86400 ))
+  if [ "$left" -ge 0 ]; then printf '%s (осталось %s дн.)' "$(printf '%s' "$d" | tr '/' '.')" "$left"
+  else printf '%s (ИСТЁК %s дн. назад)' "$(printf '%s' "$d" | tr '/' '.')" "$(( -left ))"; fi
+}
+
+# Печатает отчёт о подписях КриптоПро: лицензия, сертификаты, срок, встроенная лицензия, где лежит ключ.
+signature_report() {
+  echo "── Электронная подпись (КриптоПро) ──"
+  if [ ! -x "$CP_BIN/certmgr" ]; then
+    echo "  КриптоПро CSP не установлен — сертификатов подписи на этом Mac нет"
+    return 0
+  fi
+  echo "  Лицензия КриптоПро на этом компьютере (общая, «на рабочее место»):"
+  local lic; lic="$("$CP_SBIN/cpconfig" -license -view </dev/null 2>&1 || true)"
+  printf '%s\n' "$lic" | sed '/^[[:space:]]*$/d' | head -6 | sed 's/^/      /'
+  case "$lic" in
+    *[Ee]xpired*|*истек*|*Истек*) echo "      → истекла: подписывать можно только сертификатом со встроенной лицензией" ;;
+    *[Pp]ermanent*|*бессроч*|*Бессроч*) echo "      → бессрочная" ;;
+    *[Ee]xpires*) echo "      → временная (пробная, «демо»): после окончания нужна лицензия или сертификат со встроенной" ;;
+  esac
+  local list recs n; list="$("$CP_BIN/certmgr" -list -store uMy </dev/null 2>&1 || true)"
+  recs="$(printf '%s\n' "$list" | cert_records)"
+  n="$(printf '%s' "$recs" | grep -c '|' || true)"
+  echo "  Сертификаты в хранилище «Личное»: $n"
+  [ "$n" -gt 0 ] || return 0
+  local subj iss na elic pk cont rest folder
+  while IFS='|' read -r subj iss na elic pk cont; do
+    echo "  • $(dn_cn "$subj")"
+    echo "      выдан:        $(dn_cn "$iss")"
+    echo "      действует до: $(expiry_text "$na")"
+    if [ -n "$elic" ]; then
+      echo "      встроенная лицензия КриптоПро: ✓ есть ($elic) — подпись работает и при «демо»-лицензии"
+    else
+      echo "      встроенная лицензия КриптоПро: не найдена — нужна лицензия на рабочее место"
+    fi
+    case "$pk" in
+      Yes|yes|Да|да)
+        case "$cont" in
+          HDIMAGE*)
+            rest="${cont#HDIMAGE}"; while [ "${rest#\\}" != "$rest" ]; do rest="${rest#\\}"; done; folder="${rest%%\\*}"
+            echo "      закрытый ключ: на диске этого Mac (носитель HDIMAGE)"
+            if [ -d "$CP_KEYS_DIR/$folder" ]; then echo "        папка: $CP_KEYS_DIR/$folder"
+            else echo "        папка: $CP_KEYS_DIR/$folder (не найдена по этому пути)"; fi ;;
+          FLASH*) echo "      закрытый ключ: на флешке (носитель FLASH): $cont" ;;
+          "")     echo "      закрытый ключ: есть, носитель не указан" ;;
+          *)      echo "      закрытый ключ: на внешнем носителе/токене: $cont" ;;
+        esac ;;
+      *) echo "      закрытый ключ: не привязан — этим сертификатом подписывать нельзя" ;;
+    esac
+  done <<EOF
+$recs
+EOF
+  if [ -d "$CP_KEYS_DIR" ]; then
+    local dirs; dirs="$(ls -1d "$CP_KEYS_DIR"/*.000 2>/dev/null || true)"
+    [ -n "$dirs" ] && { echo "  Все папки с ключами на диске ($CP_KEYS_DIR):"; printf '%s\n' "$dirs" | sed 's#.*/#      #'; }
+  fi
+  return 0
+}
+
 # PID окон Firefox, запущенных именно с этим чистым профилем (по полному пути; основной Firefox не попадает).
 PROF_RE="$(printf '%s' "$PROF" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
 clean_profile_pids() { pgrep -f -- "--profile $PROF_RE( |\$)" || true; }
@@ -156,6 +245,10 @@ if security find-certificate -c "Russian Trusted Root CA" >/dev/null 2>&1; then
 else
   echo "  ✗ Корневого сертификата Минцифры нет в «Связке ключей» (нужен для Сбербанка и др.)"
 fi
+echo
+
+# --- 3а. Электронная подпись: сертификаты, срок, лицензия, где лежит ключ ---------------------
+signature_report
 echo
 
 # --- 4. Выбор программы Firefox --------------------------------------------------------------
