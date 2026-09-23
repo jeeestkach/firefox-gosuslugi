@@ -103,7 +103,7 @@ if [ -f "$INI" ]; then
     local full="$path"; [ "$rel" = 1 ] && full="$FF_ROOT/$path"
     local mark=""; printf '%s\n' "$DEFAULTS" | grep -qxF "$path" && mark="  [основной]"
     local ver="не запускался"; [ -f "$full/compatibility.ini" ] && ver="последний запуск в Firefox $(grep -E '^LastVersion=' "$full/compatibility.ini" | sed 's/^LastVersion=//; s/_.*//' || echo "?")"
-    echo "  • «$name»$mark — $ver"
+    echo "  • «${name}»$mark — $ver"
     echo "    $full"
     list_addons "$full"
   }
@@ -121,7 +121,7 @@ else
   echo "  (профилей пока нет)"
 fi
 if [ -d "$PROF" ]; then
-  echo "  • «$CLEAN_NAME» — чистый профиль для Госуслуг (уже создан ранее, в список профилей не входит)"
+  echo "  • «${CLEAN_NAME}» — чистый профиль для Госуслуг (уже создан ранее, в список профилей не входит)"
   echo "    $PROF"
   list_addons "$PROF"
 fi
@@ -160,7 +160,7 @@ fi
 [ -d "$PROF" ] && ACTION="Обновить" || ACTION="Создать"
 
 echo "── Что будет сделано ──"
-echo "  1. $ACTION отдельный профиль «$CLEAN_NAME»:"
+echo "  1. $ACTION отдельный профиль «${CLEAN_NAME}»:"
 echo "     $PROF"
 echo "  2. Добавить в него только расширение КриптоПро (скачивается с cryptopro.ru)"
 echo "  3. Положить на рабочий стол значок «Firefox Госуслуги» — запускает"
