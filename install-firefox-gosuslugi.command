@@ -41,6 +41,22 @@ app_version() { defaults read "$1/Contents/Info" CFBundleShortVersionString 2>/d
 # Идентификатор программы (org.mozilla.firefox и т.п.). $1 — путь к .app.
 app_bundle_id() { defaults read "$1/Contents/Info" CFBundleIdentifier 2>/dev/null || true; }
 
+# Состояние дополнения в профиле: active / disabled / missing. $1 — папка профиля, $2 — id дополнения.
+addon_state() {
+  osascript -l JavaScript - "$1/extensions.json" "$2" <<'JS' 2>/dev/null || echo "missing"
+function run(argv) {
+  var s = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null);
+  if (!s || s.isNil()) return "missing";
+  var a = (JSON.parse(ObjC.unwrap(s)).addons || []).filter(function (x) { return x.id === argv[1]; })[0];
+  return a ? (a.active ? "active" : "disabled") : "missing";
+}
+JS
+}
+
+# PID окон Firefox, запущенных именно с этим чистым профилем (по полному пути; основной Firefox не попадает).
+PROF_RE="$(printf '%s' "$PROF" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+clean_profile_pids() { pgrep -f -- "--profile $PROF_RE( |\$)" || true; }
+
 # Печатает дополнения профиля (только установленные пользователем). $1 — папка профиля.
 list_addons() {
   osascript -l JavaScript - "$1/extensions.json" <<'JS' 2>/dev/null || echo "      (не удалось прочитать список дополнений)"
@@ -158,8 +174,13 @@ if [ -d "$PROF" ] && [ ! -f "$MARKER" ] \
   pause_exit 1
 fi
 [ -d "$PROF" ] && ACTION="Обновить" || ACTION="Создать"
+RUNNING_PIDS="$(clean_profile_pids)"
 
 echo "── Что будет сделано ──"
+if [ -n "$RUNNING_PIDS" ]; then
+  echo "  0. Закрыть открытое окно «Firefox Госуслуги» — иначе изменения не применятся"
+  echo "     (ваш основной Firefox не закрывается)"
+fi
 echo "  1. $ACTION отдельный профиль «${CLEAN_NAME}»:"
 echo "     $PROF"
 echo "  2. Добавить в него только расширение КриптоПро (скачивается с cryptopro.ru)"
@@ -179,6 +200,13 @@ fi
 echo
 
 # --- 6. Установка ----------------------------------------------------------------------------
+if [ -n "$RUNNING_PIDS" ]; then
+  kill -TERM $RUNNING_PIDS 2>/dev/null || true
+  for _ in $(seq 1 20); do [ -z "$(clean_profile_pids)" ] && break; sleep 1; done
+  left="$(clean_profile_pids)"; [ -n "$left" ] && kill -KILL $left 2>/dev/null || true
+  sleep 1
+  echo "✓ Окно «Firefox Госуслуги» закрыто"
+fi
 mkdir -p "$PROF/extensions"
 touch "$MARKER"
 cat > "$PROF/user.js" <<'EOF'
@@ -191,8 +219,10 @@ user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
 user_pref("browser.startup.page", 1);
 user_pref("browser.startup.homepage", "https://kad.arbitr.ru/");
 user_pref("xpinstall.signatures.required", true);
-// Расширение КриптоПро кладётся в папку профиля — включать его без отдельного подтверждения.
+// Расширение КриптоПро кладётся в папку профиля — включать его без отдельного подтверждения
+// и проверять эту папку при каждом запуске (иначе Firefox видит её только при первом запуске).
 user_pref("extensions.autoDisableScopes", 14);
+user_pref("extensions.startupScanScopes", 1);
 // Запрет дополнениям встраиваться в эти сайты (первые адреса — стандартный список Mozilla).
 // Сайты судов (ej.sudrf.ru, *.arbitr.ru) НЕ включены: там расширение КриптоПро нужно для подписи.
 user_pref("extensions.webextensions.restrictedDomains", "accounts-static.cdn.mozilla.net,accounts.firefox.com,addons.cdn.mozilla.net,addons.mozilla.org,api.accounts.firefox.com,content.cdn.mozilla.net,discovery.addons.mozilla.org,oauth.accounts.firefox.com,profile.accounts.firefox.com,support.mozilla.org,sync.services.mozilla.com,esia.gosuslugi.ru,www.gosuslugi.ru,gosuslugi.ru,lk.gosuslugi.ru,www.sberbank.ru,online.sberbank.ru");
@@ -211,7 +241,21 @@ if curl -fsSL --retry 3 --retry-delay 2 --max-time 60 --ciphers "$CURL_CIPHERS" 
 fi
 if [ "$XPI_OK" = 1 ]; then
   mv -f "$XPI_TMP" "$PROF/extensions/$CP_EXT_ID.xpi"
-  echo "✓ Расширение КриптоПро для подписи добавлено в профиль"
+  echo "✓ Расширение КриптоПро скачано, проверяю установку в Firefox…"
+  # Невидимый запуск Firefox с этим профилем: он регистрирует расширение и сразу закрывается.
+  PNG_TMP="$(mktemp /tmp/ffgos-shot.XXXXXX)"
+  "$FF/Contents/MacOS/firefox" --headless --no-remote --profile "$PROF" --screenshot "$PNG_TMP" about:blank >/dev/null 2>&1 &
+  HL_PID=$!
+  for _ in $(seq 1 60); do kill -0 "$HL_PID" 2>/dev/null || break; sleep 1; done
+  kill "$HL_PID" 2>/dev/null || true
+  wait "$HL_PID" 2>/dev/null || true
+  rm -f "$PNG_TMP"
+  case "$(addon_state "$PROF" "$CP_EXT_ID")" in
+    active)   echo "✓ Расширение КриптоПро установлено и включено" ;;
+    disabled) echo "⚠ Расширение КриптоПро установлено, но выключено: включите его в меню ☰ → «Дополнения и темы»" ;;
+    *)        echo "⚠ Firefox не подтвердил установку расширения КриптоПро. Установите его вручную:"
+              echo "  откройте «Firefox Госуслуги» и перейдите по ссылке $CP_EXT_URL → «Добавить»." ;;
+  esac
 else
   rm -f "$XPI_TMP"
   echo "⚠ Не удалось скачать расширение КриптоПро. Установите его вручную: откройте"
