@@ -218,6 +218,142 @@ install_cryptopro_extension() {
   esac
 }
 
+# Разбирает system_profiler -xml (память, диски, видеокарта) и печатает строки отчёта. $1 — файл XML.
+hw_profile_lines() {
+  osascript -l JavaScript - "$1" <<'JS'
+function run(argv) {
+  var data = $.NSData.dataWithContentsOfFile(argv[0]);
+  if (!data || data.isNil()) return "  (сведения о памяти и дисках недоступны)";
+  var pl = ObjC.deepUnwrap($.NSPropertyListSerialization.propertyListWithDataOptionsFormatError(data, 0, null, null));
+  var dimms = [], memType = "", memSpeed = "", drives = [], gpus = [], out = [];
+  var str = function (v) { return typeof v === "string"; };
+  function walk(o, t) {
+    if (Array.isArray(o)) { o.forEach(function (x) { walk(x, t); }); return; }
+    if (!o || typeof o !== "object") return;
+    t = o._dataType || t;
+    // Учитываем только настоящие записи: в XML есть служебный раздел с описанием колонок,
+    // где на месте значений стоят словари.
+    if (t === "SPMemoryDataType") {
+      if (str(o.dimm_size)) dimms.push(o);
+      if (str(o.dimm_type) && !memType) memType = o.dimm_type;
+      if (str(o.dimm_speed) && !memSpeed) memSpeed = o.dimm_speed;
+    }
+    if ((t === "SPSerialATADataType" || t === "SPNVMeDataType") && typeof o.size_in_bytes === "number" &&
+        (str(o.device_model) || str(o.spsata_medium_type))) drives.push({ t: t, o: o });
+    if (t === "SPDisplaysDataType" && str(o.sppci_model)) gpus.push(o);
+    for (var k in o) if (k !== "_dataType") walk(o[k], t);
+  }
+  walk(pl, "");
+  var mem = [];
+  if (memType && memType !== "empty") mem.push(memType);
+  if (memSpeed && memSpeed !== "empty") mem.push(memSpeed);
+  if (dimms.length) {
+    var used = dimms.filter(function (d) { return !/^empty$/i.test(String(d.dimm_size)); }).length;
+    mem.push("занято слотов: " + used + " из " + dimms.length);
+  }
+  out.push("MEMDETAIL\t" + mem.join(", "));
+  gpus.forEach(function (g) {
+    var vram = [g.spdisplays_vram, g._spdisplays_vram, g.spdisplays_vram_shared].filter(str)[0] || "";
+    out.push("GPU\t" + g.sppci_model + (vram ? ", " + vram : ""));
+  });
+  drives.forEach(function (d) { try {
+    var o = d.o, kind;
+    if (d.t === "SPNVMeDataType") kind = "SSD (NVMe)";
+    else if (/solid/i.test(o.spsata_medium_type || "")) kind = "SSD";
+    else if (/rotational/i.test(o.spsata_medium_type || "")) kind = "жёсткий диск (HDD)";
+    else kind = "диск";
+    var gb = Math.round(Number(o.size_in_bytes) / 1e9);
+    out.push("DISK\t" + String(o.device_model || o._name || "диск").replace(/\s+/g, " ").trim() + " — " + kind + ", " + gb + " ГБ");
+  } catch (e) {} });
+  return out.join("\n");
+}
+JS
+}
+
+# Печатает сведения о компьютере: модель, macOS, процессор, память, видеокарта, диски, свободное место.
+hardware_report() {
+  echo "── Этот Mac ──"
+  local model_id name os cpu cores mem_gb xml lines free_gb
+  model_id="${HW_MODEL:-$(sysctl -n hw.model 2>/dev/null || echo "?")}"
+  # Маркетинговое название macOS кэширует в настройках «Об этом Mac» (например, «iMac (27 дюймов, конец 2013 г.)»).
+  name="$(defaults read com.apple.SystemProfiler "CPU Names" 2>/dev/null | sed -n 's/^[^=]*= *"\{0,1\}\([^";]*\)"\{0,1\};.*/\1/p' | head -1 || true)"
+  os="$(sw_vers -productVersion 2>/dev/null || echo "?")"
+  cpu="$(sysctl -n machdep.cpu.brand_string 2>/dev/null | sed 's/([RT]M)//g; s/  */ /g' || true)"
+  cores="$(sysctl -n hw.physicalcpu 2>/dev/null || echo "?")"
+  mem_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+  if [ -n "$name" ]; then echo "  Модель:       ${name} (${model_id})"; else echo "  Модель:       ${model_id}"; fi
+  echo "  macOS:        ${os}"
+  echo "  Процессор:    ${cpu:-?}, ядер: ${cores}"
+  if [ -n "${SP_XML_FILE:-}" ]; then xml="$SP_XML_FILE"; else
+    xml="$(mktemp /tmp/ffgos-hw.XXXXXX)"
+    with_timeout 60 system_profiler -xml SPMemoryDataType SPSerialATADataType SPNVMeDataType SPDisplaysDataType >"$xml" || true
+  fi
+  lines="$(hw_profile_lines "$xml" 2>/dev/null || true)"
+  [ -n "${SP_XML_FILE:-}" ] || rm -f "$xml"
+  local detail; detail="$(printf '%s\n' "$lines" | sed -n 's/^MEMDETAIL	//p')"
+  echo "  Память:       ${mem_gb} ГБ${detail:+ (${detail})}"
+  printf '%s\n' "$lines" | sed -n 's/^GPU	/  Видеокарта:   /p'
+  echo "  Диски:"
+  if printf '%s\n' "$lines" | grep -q '^DISK	'; then
+    printf '%s\n' "$lines" | sed -n 's/^DISK	/    • /p'
+  else
+    echo "    (не удалось определить)"
+  fi
+  if diskutil apfs list 2>/dev/null | grep -Eq 'Fusion:[[:space:]]+Yes'; then
+    echo "    (Fusion Drive: SSD и жёсткий диск объединены в один диск)"
+  fi
+  free_gb=$(( $(df -k / 2>/dev/null | awk 'NR==2 {print $4}' || echo 0) / 1000000 ))
+  echo "  Свободно на системном диске: ~${free_gb} ГБ"
+  return 0
+}
+
+# Замер скорости записи диска: пишет временный файл 1 ГБ, ждёт реальной записи (sync) и удаляет его.
+# Скорость чтения без прав администратора честно не измерить: macOS отдаёт свежий файл из памяти.
+disk_speed_test() {
+  local real best="" mbps avail_gb model run
+  model="${HW_MODEL:-$(sysctl -n hw.model 2>/dev/null || echo "?")}"
+  avail_gb=$(( $(df -k /tmp 2>/dev/null | awk 'NR==2 {print $4}' || echo 0) / 1000000 ))
+  if [ "$avail_gb" -lt 3 ]; then echo "  Мало свободного места (~${avail_gb} ГБ) — замер пропущен"; return 0; fi
+  # Глобальная переменная, а не local: ловушка EXIT срабатывает уже после выхода из функции.
+  DT_FILE="$(mktemp /tmp/ffgos-speed.XXXXXX)"
+  trap 'rm -f "${DT_FILE:-}"' EXIT
+  echo "  Три замера записи файла 1 ГБ (файл каждый раз удаляется), берём лучший…"
+  for run in 1 2 3; do
+    real="$( { LC_ALL=C /usr/bin/time -p /bin/sh -c 'dd if=/dev/zero of="$1" bs=1m count=1024 2>/dev/null && sync' _ "$DT_FILE"; } 2>&1 | LC_ALL=C awk '/^real/ {print $2}')"
+    rm -f "$DT_FILE"
+    real="${real/,/.}"
+    case "$real" in ''|*[!0-9.]*) continue ;; esac
+    if [ -z "$best" ] || LC_ALL=C awk -v a="$real" -v b="$best" 'BEGIN { exit !(a < b) }'; then best="$real"; fi
+  done
+  if [ -z "$best" ]; then echo "  Не удалось измерить скорость"; return 0; fi
+  mbps="$(LC_ALL=C awk -v r="$best" 'BEGIN { if (r > 0) printf "%.0f", 1024 / r; else print 0 }')"
+  echo "  Скорость записи вашего диска: ~${mbps} МБ/с (лучший из трёх: 1 ГБ за ${best} с)"
+  if [ "$mbps" -lt 250 ]; then echo "    → это скорость жёсткого диска (HDD)"
+  elif [ "$mbps" -lt 650 ]; then echo "    → уровень SATA SSD"
+  else echo "    → уровень PCIe/NVMe SSD"; fi
+  echo
+  echo "  Для сравнения — последовательная скорость (типичные значения):"
+  case "$model" in
+    iMac14,2)
+      echo "    • жёсткий диск 7200 об/мин (штатный в iMac 2013) ........ 120–200 МБ/с"
+      echo "    • внешний SSD по USB 3.0 (без разборки) .................. ~350–450 МБ/с"
+      echo "    • SATA SSD вместо жёсткого диска (нужно снимать экран) .... ~500–550 МБ/с"
+      echo "    • SSD в слот PCIe: родной Apple или NVMe через переходник"
+      echo "      Sintech (нужно снимать экран; шина PCIe 2.0 x2) ......... ~750–780 МБ/с"
+      echo "      Быстрее ~780 МБ/с в этом iMac не будет даже у новейших NVMe — предел шины."
+      ;;
+    *)
+      echo "    • жёсткий диск 7200 об/мин ........ 120–200 МБ/с"
+      echo "    • SATA SSD ........................ ~500–550 МБ/с"
+      echo "    • NVMe SSD (PCIe 3.0/4.0) ......... 1500–7000 МБ/с (зависит от шины компьютера)"
+      ;;
+  esac
+  echo "  Главное отличие SSD от жёсткого диска — случайный доступ (загрузка macOS, запуск программ):"
+  echo "  у любого SSD он в десятки раз быстрее, поэтому компьютер ощущается намного быстрее,"
+  echo "  чем показывает разница в МБ/с."
+  return 0
+}
+
 # PID окон Firefox, запущенных именно с этим чистым профилем (по полному пути; основной Firefox не попадает).
 PROF_RE="$(printf '%s' "$PROF" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
 clean_profile_pids() { pgrep -f -- "--profile $PROF_RE( |\$)" || true; }
@@ -247,6 +383,14 @@ echo "=============================================="
 echo
 echo "Сейчас я только покажу, что установлено. Ничего не изменится без вашего подтверждения."
 echo
+
+run_isolated "Сведения о компьютере" hardware_report
+echo
+if [ "${DISK_TEST:-}" = 1 ] || { [ -z "${ASSUME_YES:-}" ] && ask_yes "Измерить скорость диска? Будет записан и сразу удалён файл 1 ГБ (10–60 секунд)"; }; then
+  echo "── Скорость диска ──"
+  run_isolated "Замер скорости диска" disk_speed_test
+  echo
+fi
 
 # --- 1. Установленные программы Firefox -------------------------------------------------------
 shopt -s nullglob
