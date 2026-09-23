@@ -35,6 +35,38 @@ pause_exit() {
   exit "${1:-0}"
 }
 
+# Выполняет шаг, связанный с КриптоПро, в отдельном подпроцессе: любая ошибка в нём (даже неожиданная)
+# только печатает сообщение и не останавливает установку Firefox. $1 — название шага, дальше — команда.
+# «( … ) || …» не подходит: в таком контексте bash отключает set -e внутри, и ошибки проходят молча.
+run_isolated() {
+  local title="$1" rc; shift
+  set +e
+  ( set -e; "$@" )
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || echo "  ⚠ ${title}: ошибка (код ${rc}). Этот шаг пропущен, установка Firefox продолжается."
+  return 0
+}
+
+# Запускает команду с ограничением по времени и печатает её вывод. $1 — секунды, дальше — команда.
+# Возвращает код команды; при превышении времени — 124.
+with_timeout() {
+  local secs="$1" out pid i=0 rc=0; shift
+  out="$(mktemp /tmp/ffgos-cmd.XXXXXX)"
+  "$@" >"$out" 2>&1 </dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$i" -ge $((secs * 5)) ]; then
+      kill -KILL "$pid" 2>/dev/null || true
+      echo "(нет ответа за ${secs} с — остановлено)" >>"$out"; rc=124; break
+    fi
+    sleep 0.2; i=$((i + 1))
+  done
+  if [ "$rc" -eq 0 ]; then wait "$pid" 2>/dev/null || rc=$?; else wait "$pid" 2>/dev/null || true; fi
+  cat "$out"; rm -f "$out"
+  return "$rc"
+}
+
 # Версия программы по её Info.plist. $1 — путь к .app.
 app_version() { defaults read "$1/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo "?"; }
 
@@ -57,6 +89,7 @@ JS
 CP_BIN="${CP_BIN:-/opt/cprocsp/bin}"
 CP_SBIN="${CP_SBIN:-/opt/cprocsp/sbin}"
 CP_KEYS_DIR="${CP_KEYS_DIR:-/var/opt/cprocsp/keys/$(id -un)}"
+CP_TIMEOUT="${CP_TIMEOUT:-20}"   # сколько секунд ждать ответа утилит КриптоПро
 
 # Разбирает вывод «certmgr -list» в строки: владелец|издатель|действует до|встроенная лицензия|ключ|контейнер.
 cert_records() {
@@ -82,8 +115,10 @@ dn_cn() {
 expiry_text() {
   local d t now left; d="${1%% *}"
   t="$(date -j -f "%d/%m/%Y" "$d" "+%s" 2>/dev/null || true)"
-  [ -n "$t" ] || { printf '%s' "$1"; return; }
-  now="$(date "+%s")"; left=$(( (t - now) / 86400 ))
+  now="$(date "+%s" 2>/dev/null || true)"
+  # Если дату не удалось разобрать — показываем её как есть, без подсчёта дней.
+  case "$t$now" in ''|*[!0-9]*) printf '%s' "$1"; return ;; esac
+  left=$(( (t - now) / 86400 ))
   if [ "$left" -ge 0 ]; then printf '%s (осталось %s дн.)' "$(printf '%s' "$d" | tr '/' '.')" "$left"
   else printf '%s (ИСТЁК %s дн. назад)' "$(printf '%s' "$d" | tr '/' '.')" "$(( -left ))"; fi
 }
@@ -96,17 +131,21 @@ signature_report() {
     return 0
   fi
   echo "  Лицензия КриптоПро на этом компьютере (общая, «на рабочее место»):"
-  local lic; lic="$("$CP_SBIN/cpconfig" -license -view </dev/null 2>&1 || true)"
+  local lic; lic="$(with_timeout "$CP_TIMEOUT" "$CP_SBIN/cpconfig" -license -view || true)"
   printf '%s\n' "$lic" | sed '/^[[:space:]]*$/d' | head -6 | sed 's/^/      /'
   case "$lic" in
     *[Ee]xpired*|*истек*|*Истек*) echo "      → истекла: подписывать можно только сертификатом со встроенной лицензией" ;;
     *[Pp]ermanent*|*бессроч*|*Бессроч*) echo "      → бессрочная" ;;
     *[Ee]xpires*) echo "      → временная (пробная, «демо»): после окончания нужна лицензия или сертификат со встроенной" ;;
   esac
-  local list recs n; list="$("$CP_BIN/certmgr" -list -store uMy </dev/null 2>&1 || true)"
+  local list recs n lrc=0
+  list="$(with_timeout "$CP_TIMEOUT" "$CP_BIN/certmgr" -list -store uMy)" || lrc=$?
   recs="$(printf '%s\n' "$list" | cert_records)"
   n="$(printf '%s' "$recs" | grep -c '|' || true)"
   echo "  Сертификаты в хранилище «Личное»: $n"
+  if [ "$n" -eq 0 ] && [ "$lrc" -ne 0 ]; then
+    echo "      (ответ certmgr, код ${lrc}: $(printf '%s\n' "$list" | sed '/^[[:space:]]*$/d' | tail -2 | tr '\n' ' '))"
+  fi
   [ "$n" -gt 0 ] || return 0
   local subj iss na elic pk cont rest folder
   while IFS='|' read -r subj iss na elic pk cont; do
@@ -140,6 +179,43 @@ EOF
     [ -n "$dirs" ] && { echo "  Все папки с ключами на диске ($CP_KEYS_DIR):"; printf '%s\n' "$dirs" | sed 's#.*/#      #'; }
   fi
   return 0
+}
+
+# Скачивает расширение КриптоПро в чистый профиль и проверяет, что Firefox его включил.
+# Запускается через run_isolated: ошибка здесь не мешает созданию профиля и значка.
+install_cryptopro_extension() {
+  CPX_XPI="$(mktemp /tmp/cpext.XXXXXX)"; CPX_PNG=""; CPX_HL=""
+  trap 'rm -f "${CPX_XPI:-}" "${CPX_PNG:-}"; [ -z "${CPX_HL:-}" ] || kill "$CPX_HL" 2>/dev/null; true' EXIT
+  local ok=0 manifest files
+  if curl -fsSL --retry 3 --retry-delay 2 --max-time 60 --ciphers "$CURL_CIPHERS" ${CURL_OPTS:-} -o "$CPX_XPI" "$CP_EXT_URL"; then
+    # Вывод unzip сначала в переменные: связка «unzip | grep -q» при pipefail падает случайным образом.
+    manifest="$(unzip -p "$CPX_XPI" manifest.json 2>/dev/null || true)"
+    files="$(unzip -l "$CPX_XPI" 2>/dev/null || true)"
+    case "$manifest" in *"\"$CP_EXT_ID\""*)
+      case "$files" in *META-INF/mozilla.rsa*) ok=1 ;; esac ;;
+    esac
+  fi
+  if [ "$ok" != 1 ]; then
+    echo "⚠ Не удалось скачать расширение КриптоПро. Установите его вручную: откройте"
+    echo "  «Firefox Госуслуги» и перейдите по ссылке $CP_EXT_URL → «Добавить»."
+    return 0
+  fi
+  mv -f "$CPX_XPI" "$PROF/extensions/$CP_EXT_ID.xpi"
+  echo "✓ Расширение КриптоПро скачано, проверяю установку в Firefox…"
+  # Невидимый запуск Firefox с этим профилем: он регистрирует расширение и сразу закрывается.
+  CPX_PNG="$(mktemp /tmp/ffgos-shot.XXXXXX)"
+  "$FF/Contents/MacOS/firefox" --headless --no-remote --profile "$PROF" --screenshot "$CPX_PNG" about:blank >/dev/null 2>&1 &
+  CPX_HL=$!
+  for _ in $(seq 1 60); do kill -0 "$CPX_HL" 2>/dev/null || break; sleep 1; done
+  kill "$CPX_HL" 2>/dev/null || true
+  wait "$CPX_HL" 2>/dev/null || true
+  CPX_HL=""
+  case "$(addon_state "$PROF" "$CP_EXT_ID")" in
+    active)   echo "✓ Расширение КриптоПро установлено и включено" ;;
+    disabled) echo "⚠ Расширение КриптоПро установлено, но выключено: включите его в меню ☰ → «Дополнения и темы»" ;;
+    *)        echo "⚠ Firefox не подтвердил установку расширения КриптоПро. Установите его вручную:"
+              echo "  откройте «Firefox Госуслуги» и перейдите по ссылке $CP_EXT_URL → «Добавить»." ;;
+  esac
 }
 
 # PID окон Firefox, запущенных именно с этим чистым профилем (по полному пути; основной Firefox не попадает).
@@ -248,7 +324,7 @@ fi
 echo
 
 # --- 3а. Электронная подпись: сертификаты, срок, лицензия, где лежит ключ ---------------------
-signature_report
+run_isolated "Отчёт об электронной подписи" signature_report
 echo
 
 # --- 4. Выбор программы Firefox --------------------------------------------------------------
@@ -322,38 +398,7 @@ user_pref("extensions.webextensions.restrictedDomains", "accounts-static.cdn.moz
 EOF
 echo "✓ Профиль: $PROF"
 
-XPI_TMP="$(mktemp /tmp/cpext.XXXXXX)"
-XPI_OK=0
-if curl -fsSL --retry 3 --retry-delay 2 --max-time 60 --ciphers "$CURL_CIPHERS" ${CURL_OPTS:-} -o "$XPI_TMP" "$CP_EXT_URL"; then
-  # Вывод unzip сначала в переменные: связка «unzip | grep -q» при pipefail падает случайным образом.
-  XPI_MANIFEST="$(unzip -p "$XPI_TMP" manifest.json 2>/dev/null || true)"
-  XPI_FILES="$(unzip -l "$XPI_TMP" 2>/dev/null || true)"
-  case "$XPI_MANIFEST" in *"\"$CP_EXT_ID\""*)
-    case "$XPI_FILES" in *META-INF/mozilla.rsa*) XPI_OK=1 ;; esac ;;
-  esac
-fi
-if [ "$XPI_OK" = 1 ]; then
-  mv -f "$XPI_TMP" "$PROF/extensions/$CP_EXT_ID.xpi"
-  echo "✓ Расширение КриптоПро скачано, проверяю установку в Firefox…"
-  # Невидимый запуск Firefox с этим профилем: он регистрирует расширение и сразу закрывается.
-  PNG_TMP="$(mktemp /tmp/ffgos-shot.XXXXXX)"
-  "$FF/Contents/MacOS/firefox" --headless --no-remote --profile "$PROF" --screenshot "$PNG_TMP" about:blank >/dev/null 2>&1 &
-  HL_PID=$!
-  for _ in $(seq 1 60); do kill -0 "$HL_PID" 2>/dev/null || break; sleep 1; done
-  kill "$HL_PID" 2>/dev/null || true
-  wait "$HL_PID" 2>/dev/null || true
-  rm -f "$PNG_TMP"
-  case "$(addon_state "$PROF" "$CP_EXT_ID")" in
-    active)   echo "✓ Расширение КриптоПро установлено и включено" ;;
-    disabled) echo "⚠ Расширение КриптоПро установлено, но выключено: включите его в меню ☰ → «Дополнения и темы»" ;;
-    *)        echo "⚠ Firefox не подтвердил установку расширения КриптоПро. Установите его вручную:"
-              echo "  откройте «Firefox Госуслуги» и перейдите по ссылке $CP_EXT_URL → «Добавить»." ;;
-  esac
-else
-  rm -f "$XPI_TMP"
-  echo "⚠ Не удалось скачать расширение КриптоПро. Установите его вручную: откройте"
-  echo "  «Firefox Госуслуги» и перейдите по ссылке $CP_EXT_URL → «Добавить»."
-fi
+run_isolated "Установка расширения КриптоПро" install_cryptopro_extension
 
 SCRIPT_FILE="$(mktemp /tmp/ffgos.XXXXXX)"
 cat > "$SCRIPT_FILE" <<EOF
