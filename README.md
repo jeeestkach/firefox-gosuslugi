@@ -57,6 +57,16 @@ curl -fsSL https://raw.githubusercontent.com/jeeestkach/firefox-gosuslugi/main/i
 
 Если macOS спросит про доступ Терминала к папке «Рабочий стол», нажмите **OK**.
 
+Git и инструменты разработчика не нужны: файл скачивается встроенной в macOS командой `curl`.
+
+**Если команда выдала ошибку сертификата** (на старых macOS встречается), скачайте тот же файл через CDN jsDelivr:
+
+```
+curl -fsSL https://cdn.jsdelivr.net/gh/jeeestkach/firefox-gosuslugi@main/install-firefox-gosuslugi.command -o ~/Downloads/install-firefox-gosuslugi.command && bash ~/Downloads/install-firefox-gosuslugi.command
+```
+
+jsDelivr обновляет копию с задержкой до 12 часов. Если не сработает и это, откройте файл `install-firefox-gosuslugi.command` на GitHub в браузере, нажмите **«Download raw file»**, затем в Терминале напечатайте `bash`, поставьте пробел, перетащите скачанный файл в окно и нажмите Enter.
+
 ## Что нужно для подписи
 
 - **КриптоПро CSP** и **КриптоПро ЭЦП Browser plug-in** для macOS: https://www.cryptopro.ru/products/cades/plugin
